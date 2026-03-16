@@ -1,0 +1,220 @@
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+      - feature/*
+      - release/*
+
+pr:
+  branches:
+    include:
+      - main
+      - develop
+
+pool:
+  vmImage: "ubuntu-latest"
+
+variables:
+  - group: healthpulse-variables  # Variable group with secrets
+  - name: IMAGE_NAME
+    value: "healthpulse"
+  - name: IMAGE_TAG
+    value: "$(Build.SourceBranchName)-$(Build.BuildId)-$(Build.SourceVersion)"
+
+stages:
+  # ============================================
+  # Stage 1: Build & Test
+  # ============================================
+  - stage: Build
+    displayName: "Build & Test"
+    jobs:
+      - job: BuildAndTest
+        displayName: "Lint, Test, Scan, Build"
+        steps:
+          - task: NodeTool@0
+            displayName: "Install Node.js 20"
+            inputs:
+              versionSpec: "20.x"
+
+          - script: |
+              corepack enable
+              pnpm install --frozen-lockfile
+            displayName: "Install Dependencies"
+
+          - script: pnpm lint
+            displayName: "ESLint"
+
+          - script: pnpm format:check
+            displayName: "Prettier Check"
+
+          - script: pnpm test:coverage
+            displayName: "Unit Tests with Coverage"
+
+          - task: PublishCodeCoverageResults@2
+            displayName: "Publish Coverage"
+            inputs:
+              summaryFileLocation: "coverage/cobertura-coverage.xml"
+              failIfCoverageEmpty: true
+
+          # Snyk Security Scan
+          - task: SnykSecurityScan@1
+            displayName: "Snyk Dependency Scan"
+            inputs:
+              serviceConnectionEndpoint: "snyk-connection"
+              testType: "app"
+              severityThreshold: "high"
+              failOnIssues: true
+
+          # SonarQube Analysis
+          - task: SonarQubePrepare@6
+            displayName: "Prepare SonarQube"
+            inputs:
+              SonarQube: "sonarqube-connection"
+              scannerMode: "CLI"
+              configMode: "manual"
+              cliProjectKey: "healthpulse"
+              cliProjectName: "HealthPulse Patient Portal"
+              cliSources: "src"
+              extraProperties: |
+                sonar.tests=tests
+                sonar.typescript.lcov.reportPaths=coverage/lcov.info
+
+          - task: SonarQubeAnalyze@6
+            displayName: "Run SonarQube Analysis"
+
+          - task: SonarQubePublish@6
+            displayName: "Publish SonarQube Quality Gate"
+            inputs:
+              pollingTimeoutSec: "300"
+
+          # Build Application
+          - script: pnpm build
+            displayName: "Build Application"
+
+          # Build Docker Image
+          - task: Docker@2
+            displayName: "Build Docker Image"
+            inputs:
+              command: "build"
+              Dockerfile: "docker/Dockerfile"
+              buildContext: "."
+              tags: |
+                $(IMAGE_TAG)
+                $(Build.SourceVersion)
+              arguments: "--build-arg VITE_ENV=production --build-arg VITE_APP_VERSION=$(IMAGE_TAG)"
+
+          # Publish to Artifactory
+          - task: ArtifactoryDocker@1
+            displayName: "Push to Artifactory"
+            inputs:
+              command: "push"
+              artifactoryService: "artifactory-connection"
+              targetRepo: "docker-local"
+              imageName: "$(ARTIFACTORY_URL)/docker-local/$(IMAGE_NAME):$(IMAGE_TAG)"
+
+          # Publish dist as pipeline artifact
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish Build Artifact"
+            inputs:
+              targetPath: "dist"
+              artifact: "healthpulse-dist"
+              publishLocation: "pipeline"
+
+  # ============================================
+  # Stage 2: Deploy to DEV (auto)
+  # ============================================
+  - stage: DeployDev
+    displayName: "Deploy to DEV"
+    dependsOn: Build
+    condition: succeeded()
+    jobs:
+      - deployment: DeployDev
+        displayName: "Deploy to DEV"
+        environment: "healthpulse-dev"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - script: |
+                    echo "Deploying $(IMAGE_NAME):$(IMAGE_TAG) to DEV"
+                    echo "TODO: Trigger Ansible Tower job template for DEV deployment"
+                  displayName: "Deploy via Ansible Tower"
+
+                - script: |
+                    echo "Running smoke tests against DEV..."
+                    curl -f http://dev.healthpulse.internal/health || exit 1
+                  displayName: "Smoke Test"
+
+  # ============================================
+  # Stage 3: Deploy to STAGING (auto)
+  # ============================================
+  - stage: DeployStaging
+    displayName: "Deploy to STAGING"
+    dependsOn: DeployDev
+    condition: succeeded()
+    jobs:
+      - deployment: DeployStaging
+        displayName: "Deploy to STAGING"
+        environment: "healthpulse-staging"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - script: |
+                    echo "Deploying $(IMAGE_NAME):$(IMAGE_TAG) to STAGING"
+                    echo "TODO: Trigger Ansible Tower job template for STAGING deployment"
+                  displayName: "Deploy via Ansible Tower"
+
+                - script: |
+                    echo "Running E2E tests against STAGING..."
+                    npx playwright test --config=playwright.config.ts
+                  displayName: "Playwright E2E Tests"
+                  env:
+                    BASE_URL: "http://staging.healthpulse.internal"
+
+  # ============================================
+  # Stage 4: Deploy to QA (manual gate)
+  # ============================================
+  - stage: DeployQA
+    displayName: "Deploy to QA"
+    dependsOn: DeployStaging
+    condition: succeeded()
+    jobs:
+      - deployment: DeployQA
+        displayName: "Deploy to QA"
+        environment: "healthpulse-qa"  # Configure approval gate in Azure DevOps
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - script: |
+                    echo "Deploying $(IMAGE_NAME):$(IMAGE_TAG) to QA"
+                    echo "TODO: Trigger Ansible Tower job template for QA deployment"
+                  displayName: "Deploy via Ansible Tower"
+
+                - script: |
+                    echo "Running full regression + Lighthouse CI..."
+                  displayName: "QA Validation"
+
+  # ============================================
+  # Stage 5: Deploy to PRODUCTION (manual + 2 approvers)
+  # ============================================
+  - stage: DeployProd
+    displayName: "Deploy to PRODUCTION"
+    dependsOn: DeployQA
+    condition: succeeded()
+    jobs:
+      - deployment: DeployProd
+        displayName: "Blue-Green Deploy to PROD"
+        environment: "healthpulse-prod"  # Configure 2-person approval gate
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - script: |
+                    echo "Deploying $(IMAGE_NAME):$(IMAGE_TAG) to PROD (Green)"
+                    echo "TODO: Ansible Tower blue-green deployment"
+                    echo "TODO: Switch ALB target group"
+                    echo "TODO: Monitor Datadog for 10 minutes"
+                  displayName: "Blue-Green Deploy via Ansible Tower"

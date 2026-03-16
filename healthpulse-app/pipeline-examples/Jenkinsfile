@@ -1,0 +1,173 @@
+pipeline {
+    agent {
+        docker {
+            image 'node:20-alpine'
+            args '-v /var/run/docker.sock:/var/run/docker.sock'
+        }
+    }
+
+    environment {
+        ARTIFACTORY_URL     = credentials('artifactory-url')
+        ARTIFACTORY_CREDS   = credentials('artifactory-credentials')
+        SONAR_HOST_URL      = credentials('sonarqube-url')
+        SONAR_TOKEN         = credentials('sonarqube-token')
+        SNYK_TOKEN          = credentials('snyk-token')
+        SLACK_WEBHOOK       = credentials('slack-webhook-url')
+        IMAGE_NAME          = 'healthpulse'
+        IMAGE_TAG           = "${env.BRANCH_NAME}-${env.BUILD_NUMBER}-${env.GIT_COMMIT.take(7)}"
+    }
+
+    options {
+        timeout(time: 15, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_SHA_SHORT = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                }
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                sh '''
+                    corepack enable
+                    pnpm install --frozen-lockfile
+                '''
+            }
+        }
+
+        stage('Lint & Format') {
+            steps {
+                sh 'pnpm lint'
+                sh 'pnpm format:check'
+            }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                sh 'pnpm test:coverage'
+            }
+            post {
+                always {
+                    // Publish test coverage report
+                    publishHTML(target: [
+                        allowMissing: false,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: 'coverage',
+                        reportFiles: 'index.html',
+                        reportName: 'Coverage Report'
+                    ])
+                }
+            }
+        }
+
+        stage('Snyk Security Scan') {
+            steps {
+                sh '''
+                    npx snyk auth $SNYK_TOKEN
+                    npx snyk test --severity-threshold=high
+                '''
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh '''
+                        npx sonar-scanner \
+                            -Dsonar.projectKey=healthpulse \
+                            -Dsonar.projectName="HealthPulse Patient Portal" \
+                            -Dsonar.sources=src \
+                            -Dsonar.tests=tests \
+                            -Dsonar.typescript.lcov.reportPaths=coverage/lcov.info \
+                            -Dsonar.host.url=$SONAR_HOST_URL \
+                            -Dsonar.login=$SONAR_TOKEN
+                    '''
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Build Application') {
+            steps {
+                sh 'pnpm build'
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh """
+                    docker build \
+                        -f docker/Dockerfile \
+                        --build-arg VITE_ENV=production \
+                        --build-arg VITE_APP_VERSION=${IMAGE_TAG} \
+                        -t ${IMAGE_NAME}:${IMAGE_TAG} \
+                        -t ${IMAGE_NAME}:${GIT_SHA_SHORT} \
+                        .
+                """
+                script {
+                    if (env.BRANCH_NAME == 'main') {
+                        sh "docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest"
+                    }
+                }
+            }
+        }
+
+        stage('Snyk Container Scan') {
+            steps {
+                sh "npx snyk container test ${IMAGE_NAME}:${IMAGE_TAG} --severity-threshold=high"
+            }
+        }
+
+        stage('Publish to Artifactory') {
+            steps {
+                sh """
+                    docker login ${ARTIFACTORY_URL} -u ${ARTIFACTORY_CREDS_USR} -p ${ARTIFACTORY_CREDS_PSW}
+                    docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${ARTIFACTORY_URL}/docker-local/${IMAGE_NAME}:${IMAGE_TAG}
+                    docker push ${ARTIFACTORY_URL}/docker-local/${IMAGE_NAME}:${IMAGE_TAG}
+                """
+                // Also publish the dist tarball
+                sh """
+                    tar -czf healthpulse-${IMAGE_TAG}.tar.gz dist/
+                    curl -u ${ARTIFACTORY_CREDS_USR}:${ARTIFACTORY_CREDS_PSW} \
+                        -T healthpulse-${IMAGE_TAG}.tar.gz \
+                        "${ARTIFACTORY_URL}/generic-local/healthpulse/healthpulse-${IMAGE_TAG}.tar.gz"
+                """
+            }
+        }
+    }
+
+    post {
+        success {
+            slackSend(
+                channel: '#hp-builds',
+                color: 'good',
+                message: "BUILD SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)\nBranch: ${env.BRANCH_NAME}\nImage: ${IMAGE_NAME}:${IMAGE_TAG}"
+            )
+        }
+        failure {
+            slackSend(
+                channel: '#hp-builds',
+                color: 'danger',
+                message: "BUILD FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)\nBranch: ${env.BRANCH_NAME}\nStage: ${env.STAGE_NAME}"
+            )
+        }
+        always {
+            cleanWs()
+        }
+    }
+}

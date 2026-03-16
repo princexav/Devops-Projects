@@ -1,0 +1,18 @@
+#!/bin/sh
+
+# Enforce conventional commit format: type(scope): message
+# Valid types: feat, fix, docs, style, refactor, test, chore, ci, build, perf
+commit_msg=$(cat "$1")
+pattern="^(feat|fix|docs|style|refactor|test|chore|ci|build|perf)(\([a-zA-Z0-9_-]+\))?: .{3,}"
+
+if ! echo "$commit_msg" | grep -qE "$pattern"; then
+  echo "ERROR: Invalid commit message format."
+  echo ""
+  echo "Expected: type(scope): message"
+  echo "  Types: feat, fix, docs, style, refactor, test, chore, ci, build, perf"
+  echo "  Example: feat(appointments): add booking calendar"
+  echo "  Example: fix(auth): resolve login redirect loop"
+  echo ""
+  echo "Your message: $commit_msg"
+  exit 1
+fi

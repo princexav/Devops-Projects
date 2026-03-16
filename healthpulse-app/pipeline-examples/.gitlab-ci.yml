@@ -1,0 +1,218 @@
+image: node:20-alpine
+
+stages:
+  - install
+  - quality
+  - test
+  - security
+  - build
+  - publish
+  - deploy-dev
+  - deploy-staging
+  - deploy-qa
+  - deploy-prod
+
+variables:
+  IMAGE_NAME: "healthpulse"
+  IMAGE_TAG: "${CI_COMMIT_REF_SLUG}-${CI_PIPELINE_IID}-${CI_COMMIT_SHORT_SHA}"
+  ARTIFACTORY_REGISTRY: "${ARTIFACTORY_URL}/docker-local"
+
+cache:
+  key: "${CI_COMMIT_REF_SLUG}"
+  paths:
+    - node_modules/
+    - .pnpm-store/
+
+# ============================================
+# Install Dependencies
+# ============================================
+install:
+  stage: install
+  script:
+    - corepack enable
+    - pnpm install --frozen-lockfile
+  artifacts:
+    paths:
+      - node_modules/
+    expire_in: 1 hour
+
+# ============================================
+# Code Quality
+# ============================================
+lint:
+  stage: quality
+  needs: [install]
+  script:
+    - corepack enable
+    - pnpm lint
+
+format-check:
+  stage: quality
+  needs: [install]
+  script:
+    - corepack enable
+    - pnpm format:check
+
+# ============================================
+# Testing
+# ============================================
+unit-tests:
+  stage: test
+  needs: [install]
+  script:
+    - corepack enable
+    - pnpm test:coverage
+  coverage: '/All files\s*\|\s*[\d.]+\s*\|\s*[\d.]+\s*\|\s*[\d.]+\s*\|\s*([\d.]+)/'
+  artifacts:
+    when: always
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+    paths:
+      - coverage/
+    expire_in: 7 days
+
+# ============================================
+# Security Scanning
+# ============================================
+snyk-scan:
+  stage: security
+  needs: [install]
+  image: snyk/snyk:node
+  script:
+    - snyk auth $SNYK_TOKEN
+    - snyk test --severity-threshold=high
+  allow_failure: false
+
+sonarqube-analysis:
+  stage: security
+  needs: [unit-tests]
+  image:
+    name: sonarsource/sonar-scanner-cli:latest
+    entrypoint: [""]
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+    GIT_DEPTH: "0"
+  script:
+    - sonar-scanner
+      -Dsonar.projectKey=healthpulse
+      -Dsonar.projectName="HealthPulse Patient Portal"
+      -Dsonar.sources=src
+      -Dsonar.tests=tests
+      -Dsonar.host.url=$SONAR_HOST_URL
+      -Dsonar.login=$SONAR_TOKEN
+      -Dsonar.typescript.lcov.reportPaths=coverage/lcov.info
+      -Dsonar.qualitygate.wait=true
+
+# ============================================
+# Build
+# ============================================
+build-app:
+  stage: build
+  needs: [lint, format-check, unit-tests, snyk-scan]
+  script:
+    - corepack enable
+    - pnpm build
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 7 days
+
+build-docker:
+  stage: build
+  needs: [build-app]
+  image: docker:24
+  services:
+    - docker:24-dind
+  script:
+    - docker build
+      -f docker/Dockerfile
+      --build-arg VITE_ENV=production
+      --build-arg VITE_APP_VERSION=$IMAGE_TAG
+      -t $IMAGE_NAME:$IMAGE_TAG
+      -t $IMAGE_NAME:$CI_COMMIT_SHORT_SHA
+      .
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        docker tag $IMAGE_NAME:$IMAGE_TAG $IMAGE_NAME:latest
+      fi
+    # Snyk container scan
+    - docker run --rm -e SNYK_TOKEN
+      -v /var/run/docker.sock:/var/run/docker.sock
+      snyk/snyk:docker
+      snyk container test $IMAGE_NAME:$IMAGE_TAG --severity-threshold=high || true
+
+# ============================================
+# Publish to Artifactory
+# ============================================
+publish:
+  stage: publish
+  needs: [build-docker, sonarqube-analysis]
+  image: docker:24
+  services:
+    - docker:24-dind
+  script:
+    - docker login $ARTIFACTORY_URL -u $ARTIFACTORY_USER -p $ARTIFACTORY_PASSWORD
+    - docker tag $IMAGE_NAME:$IMAGE_TAG $ARTIFACTORY_REGISTRY/$IMAGE_NAME:$IMAGE_TAG
+    - docker push $ARTIFACTORY_REGISTRY/$IMAGE_NAME:$IMAGE_TAG
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        docker tag $IMAGE_NAME:$IMAGE_TAG $ARTIFACTORY_REGISTRY/$IMAGE_NAME:latest
+        docker push $ARTIFACTORY_REGISTRY/$IMAGE_NAME:latest
+      fi
+
+# ============================================
+# Deploy Stages
+# ============================================
+deploy-dev:
+  stage: deploy-dev
+  needs: [publish]
+  environment:
+    name: dev
+    url: http://dev.healthpulse.internal
+  script:
+    - echo "Triggering Ansible Tower deployment to DEV..."
+    - echo "TODO - Call Ansible Tower API to run deploy-app.yml for DEV"
+    - echo "Running smoke test..."
+    - apk add --no-cache curl
+    - curl -f http://dev.healthpulse.internal/health || exit 1
+
+deploy-staging:
+  stage: deploy-staging
+  needs: [deploy-dev]
+  environment:
+    name: staging
+    url: http://staging.healthpulse.internal
+  script:
+    - echo "Triggering Ansible Tower deployment to STAGING..."
+    - echo "TODO - Call Ansible Tower API to run deploy-app.yml for STAGING"
+    - echo "Running E2E tests..."
+    - echo "TODO - Run Playwright tests against staging URL"
+
+deploy-qa:
+  stage: deploy-qa
+  needs: [deploy-staging]
+  environment:
+    name: qa
+    url: http://qa.healthpulse.internal
+  when: manual  # Manual approval gate
+  script:
+    - echo "Triggering Ansible Tower deployment to QA..."
+    - echo "TODO - Full regression + performance tests"
+
+deploy-prod:
+  stage: deploy-prod
+  needs: [deploy-qa]
+  environment:
+    name: production
+    url: https://healthpulse.example.com
+  when: manual  # Manual approval (configure 2-person approval in GitLab)
+  script:
+    - echo "Triggering Blue-Green deployment to PRODUCTION..."
+    - echo "TODO - Ansible Tower blue-green deployment"
+    - echo "TODO - ALB target group switch"
+    - echo "TODO - Datadog synthetic test validation"
+    - echo "TODO - 10-minute monitoring window"
+  only:
+    - main

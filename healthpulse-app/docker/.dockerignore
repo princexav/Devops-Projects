@@ -1,0 +1,14 @@
+node_modules
+dist
+coverage
+.git
+.husky
+*.md
+tests
+terraform
+ansible
+k8s
+helm
+scripts
+pipeline-examples
+.env*
