@@ -22,15 +22,16 @@ export function MessagesPage() {
 
   const unreadCount = messages.filter((m) => !m.read).length;
 
-  const threads = messages.reduce(
+  const threads = messages.reduce<Record<string, typeof messages>>(
     (acc, msg) => {
-      if (!acc[msg.threadId]) {
-        acc[msg.threadId] = [];
+      const key = msg.threadId;
+      if (!acc[key]) {
+        acc[key] = [];
       }
-      acc[msg.threadId].push(msg);
+      acc[key]!.push(msg);
       return acc;
     },
-    {} as Record<string, typeof messages>,
+    {},
   );
 
   return (
