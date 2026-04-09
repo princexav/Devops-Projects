@@ -91,13 +91,92 @@ YOU ──SSH/kubectl──→│  ┌──────────────
 **How the cluster forms automatically:**
 
 1. Terraform creates the master EC2 first
-2. Master's `user_data` script installs k3s server with a random join token
+2. Master's bootstrap script (`scripts/master-deploy.sh`) installs k3s server with a random join token
 3. Terraform then creates workers (they depend on master)
-4. Each worker's `user_data` waits for master's API to be reachable (port 6443)
+4. Each worker's bootstrap script (`scripts/worker-deploy.sh`) waits for master's API to be reachable (port 6443)
 5. Workers install k3s agent using the same token → auto-join the cluster
 6. Within ~3 minutes, all 3 nodes are Ready
 
-### 1.2 — Initialize and Plan
+### 1.2 — Understand the Bootstrap Scripts
+
+The EC2 instances bootstrap themselves using two bash scripts in `terraform/k3s/scripts/`. Terraform reads these files and injects variables at plan/apply time using `templatefile()`.
+
+**`scripts/master-deploy.sh`** — runs on the master node:
+```bash
+#!/bin/bash
+set -e
+
+apt-get update -y && apt-get upgrade -y
+
+# Install k3s in server (master) mode
+# ${k3s_token} is injected by Terraform — becomes the actual 32-char token
+curl -sfL https://get.k3s.io | K3S_TOKEN="${k3s_token}" sh -s - server \
+  --write-kubeconfig-mode 644 \
+  --tls-san $(curl -s http://169.254.169.254/latest/meta-data/public-ipv4) \
+  --node-name k3s-master
+```
+
+| Flag | Purpose |
+|------|---------|
+| `K3S_TOKEN` | Shared secret — workers use this same token to join the cluster |
+| `--write-kubeconfig-mode 644` | Makes kubeconfig readable without sudo |
+| `--tls-san <public-ip>` | Adds the public IP to the API server's TLS certificate so you can run `kubectl` from your local machine |
+| `--node-name k3s-master` | Human-readable name in `kubectl get nodes` |
+
+**`scripts/worker-deploy.sh`** — runs on each worker node:
+```bash
+#!/bin/bash
+set -e
+
+apt-get update -y && apt-get upgrade -y
+
+# Wait for master API to be ready before trying to join
+MASTER_IP="${master_ip}"        # ← injected by Terraform (master's private IP)
+until curl -sk https://$MASTER_IP:6443 > /dev/null 2>&1; do
+  echo "Waiting for k3s master at $MASTER_IP..."
+  sleep 10
+done
+
+# Install k3s in agent (worker) mode — auto-joins the master
+curl -sfL https://get.k3s.io | K3S_URL="https://$MASTER_IP:6443" K3S_TOKEN="${k3s_token}" sh -s - agent \
+  --node-name k3s-worker-${worker_index}   # ← 1 or 2, injected by Terraform
+```
+
+| Flag | Purpose |
+|------|---------|
+| `K3S_URL` | Tells the agent where the master's API server is |
+| `K3S_TOKEN` | Same token as the master — proves this worker is authorized to join |
+| `--node-name` | `k3s-worker-1` or `k3s-worker-2` |
+
+**How `templatefile()` works in `main.tf`:**
+```hcl
+# Terraform reads the .sh file and replaces ${...} variables with real values
+user_data = templatefile("${path.module}/scripts/master-deploy.sh", {
+  k3s_token = random_password.k3s_token.result    # 32-char random string
+})
+
+user_data = templatefile("${path.module}/scripts/worker-deploy.sh", {
+  k3s_token    = random_password.k3s_token.result  # same token as master
+  master_ip    = aws_instance.master.private_ip    # e.g. "10.20.1.45"
+  worker_index = count.index + 1                   # 1 or 2
+})
+```
+
+> **Why external scripts instead of inline?** Inline heredocs inside Terraform are hard to read, hard to test, and prone to indentation bugs (we hit this in Task G). External `.sh` files are clean, editable, and can be reviewed independently.
+
+**File structure:**
+```
+terraform/k3s/
+├── main.tf                  ← references scripts via templatefile()
+├── variables.tf
+├── outputs.tf
+├── dev.tfvars
+└── scripts/
+    ├── master-deploy.sh     ← k3s server install
+    └── worker-deploy.sh     ← k3s agent join
+```
+
+### 1.3 — Initialize and Plan
 
 ```bash
 cd terraform/k3s
@@ -125,7 +204,7 @@ Review the plan. You should see **11 resources**:
 10. `aws_instance.worker[1]` — k3s agent (worker 2)
 11. `aws_eip.master` — static IP for master
 
-### 1.3 — Apply
+### 1.4 — Apply
 
 ```bash
 terraform apply \
@@ -136,7 +215,7 @@ terraform apply \
 
 Type `yes`. This takes **3–5 minutes** (3 EC2 instances + bootstrap scripts).
 
-### 1.4 — Capture the Outputs
+### 1.5 — Capture the Outputs
 
 ```bash
 terraform output
@@ -460,6 +539,79 @@ healthpulse-prod   healthpulse-portal-xxx   1/1   Running   0   1m
 
 ## Step 8: Configure Auto-Scaling (HPA)
 
+### 8.1 — What is HPA?
+
+**HPA (Horizontal Pod Autoscaler)** automatically increases or decreases the number of pods (container copies) based on how busy they are.
+
+**Simple analogy — a restaurant:**
+- **Without HPA:** You always have 2 waiters, whether it's Monday lunch (empty) or Saturday night (packed). Customers wait, or you're overpaying idle staff.
+- **With HPA:** You start with 2 waiters. When the restaurant fills up (CPU goes above 70%), a 3rd waiter automatically clocks in. When it's quiet again, the extra waiter goes home.
+
+**What it looks like in your cluster:**
+
+```
+Normal load (2 pods):
+┌─────────┐  ┌─────────┐
+│  Pod 1  │  │  Pod 2  │   CPU: 30%  <- comfortably serving traffic
+│  Nginx  │  │  Nginx  │
+└─────────┘  └─────────┘
+
+Traffic spike hits (HPA scales to 4 pods):
+┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐
+│  Pod 1  │  │  Pod 2  │  │  Pod 3  │  │  Pod 4  │   CPU: 65% <- handling it
+│  Nginx  │  │  Nginx  │  │  Nginx  │  │  Nginx  │
+└─────────┘  └─────────┘  └─────────┘  └─────────┘
+                                         ^ auto-created by HPA
+
+Traffic drops (HPA scales back to 2 pods):
+┌─────────┐  ┌─────────┐
+│  Pod 1  │  │  Pod 2  │   CPU: 20%  <- extra pods removed
+└─────────┘  └─────────┘
+```
+
+### 8.2 — Your HPA Configuration (`kubernetes/hpa.yml`)
+
+```yaml
+minReplicas: 2          # Never go below 2 pods (high availability)
+maxReplicas: 6          # Never go above 6 pods (cost control)
+metrics:
+  - cpu: 70%            # Scale up when average CPU exceeds 70%
+  - memory: 80%         # Scale up when average memory exceeds 80%
+```
+
+**The decision loop (runs every 15 seconds):**
+
+```
+1. Metrics-server collects CPU/memory from all pods
+2. HPA checks: is average CPU > 70% or memory > 80%?
+   |-- YES --> add pods (up to max 6)
+   |-- NO  --> is average CPU < 70% AND traffic low?
+               |-- YES --> remove pods (down to min 2)
+               |-- NO  --> do nothing
+```
+
+### 8.3 — Use Case for HealthPulse
+
+| Scenario | What Happens |
+|----------|-------------|
+| **Normal day** | 2 pods handle all patient portal traffic |
+| **Monday 9 AM** | Patients check appointments — traffic spikes — HPA scales to 4 pods |
+| **Lab results released** | Hundreds of patients check at once — HPA scales to 6 pods |
+| **2 AM** | Nobody using the portal — HPA scales back to 2 pods |
+| **Pod crashes** | Kubernetes restarts the pod AND HPA ensures minimum 2 are always running |
+
+### 8.4 — Why This Matters (Compare with Task G and H)
+
+| | Bare-Metal (Task G) | Docker (Task H) | Kubernetes + HPA (Task I) |
+|--|-----|------|------|
+| Traffic spike | Server overloaded, users wait | Manually start more containers | **Auto-scales in seconds** |
+| Traffic drops | Server idle, still paying | Manually stop containers | **Auto-scales down, saves cost** |
+| Pod/container dies | App is down until you fix it | App is down until you restart | **Auto-heals, no human needed** |
+
+> **Bottom line:** HPA is Kubernetes doing what a human ops engineer would do (add servers when busy, remove when quiet) — but automatically, 24/7, in seconds instead of minutes.
+
+### 8.5 — Apply HPA
+
 ```bash
 # Apply HPA to dev
 sed "s|namespace: healthpulse-prod|namespace: healthpulse-dev|g" \
@@ -474,26 +626,27 @@ NAME              REFERENCE                       TARGETS           MINPODS   MA
 healthpulse-hpa   Deployment/healthpulse-portal   5%/70%, 12%/80%   2         6         2          30s
 ```
 
-> **How HPA works:**
-> - k3s ships with metrics-server (no extra install needed)
-> - The HPA watches CPU and memory utilization of your pods
-> - If CPU exceeds 70% or memory exceeds 80%, it adds pods (up to 6)
-> - When load drops, it scales back down (to minimum 2)
+> **Note:** k3s ships with metrics-server pre-installed — HPA works out of the box with no extra setup.
 
-### Test Auto-Scaling (Optional)
+### 8.6 — Test Auto-Scaling (Optional)
 
 Generate some load to see HPA in action:
 
 ```bash
-# In one terminal — watch HPA
+# In one terminal — watch HPA (it updates every 15 seconds)
 kubectl get hpa -n healthpulse-dev -w
 
 # In another terminal — generate load
 kubectl run load-test --image=busybox -n healthpulse-dev --restart=Never -- \
   /bin/sh -c "while true; do wget -q -O- http://healthpulse-service/health; done"
 
+# Watch the TARGETS column — CPU will climb, then REPLICAS will increase
+# This may take 1-2 minutes
+
 # After watching it scale up, delete the load generator
 kubectl delete pod load-test -n healthpulse-dev
+
+# Watch it scale back down (takes ~5 minutes — K8s is cautious about scaling down)
 ```
 
 ---
